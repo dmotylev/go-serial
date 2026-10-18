@@ -8,6 +8,7 @@ package serial
 
 import (
 	"regexp"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,11 +17,13 @@ const devFolder = "/dev"
 
 var osPortFilter = regexp.MustCompile(`^(cu|tty)\..*`)
 
-const ioctlTcgetattr = unix.TIOCGETA
-const ioctlTcsetattr = unix.TIOCSETA
-const ioctlTcflsh = unix.TIOCFLUSH
-const ioctlTioccbrk = unix.TIOCCBRK
-const ioctlTiocsbrk = unix.TIOCSBRK
+const (
+	ioctlTcgetattr = unix.TIOCGETA
+	ioctlTcsetattr = unix.TIOCSETA
+	ioctlTcflsh    = unix.TIOCFLUSH
+	ioctlTioccbrk  = unix.TIOCCBRK
+	ioctlTiocsbrk  = unix.TIOCSBRK
+)
 
 func setTermSettingsBaudrate(speed int, settings *unix.Termios) (error, bool) {
 	baudrate, ok := baudrateMap[speed]
@@ -38,9 +41,21 @@ func (port *unixPort) setSpecialBaudrate(speed uint32) error {
 }
 
 func (port *unixPort) ResetInputBuffer() error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return &PortError{code: PortClosed}
+	}
+
 	return unix.IoctlSetPointerInt(port.handle, ioctlTcflsh, unix.TCIFLUSH)
 }
 
 func (port *unixPort) ResetOutputBuffer() error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return &PortError{code: PortClosed}
+	}
+
 	return unix.IoctlSetPointerInt(port.handle, ioctlTcflsh, unix.TCOFLUSH)
 }

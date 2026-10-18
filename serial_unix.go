@@ -11,6 +11,7 @@ package serial
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +22,8 @@ import (
 )
 
 type unixPort struct {
-	handle int
+	handle    int
+	exclusive bool
 
 	readTimeout time.Duration
 	closeLock   sync.RWMutex
@@ -34,26 +36,23 @@ func (port *unixPort) Close() error {
 		return nil
 	}
 
-	// Close port
-	port.releaseExclusiveAccess()
-	if err := unix.Close(port.handle); err != nil {
-		return err
-	}
-
 	if port.closeSignal != nil {
-		// Send close signal to all pending reads (if any)
 		port.closeSignal.Write([]byte{0})
-
-		// Wait for all readers to complete
 		port.closeLock.Lock()
 		defer port.closeLock.Unlock()
+	}
 
-		// Close signaling pipe
-		if err := port.closeSignal.Close(); err != nil {
-			return err
+	if port.exclusive {
+		port.releaseExclusiveAccess()
+	}
+	err := unix.Close(port.handle)
+	if port.closeSignal != nil {
+		pipeErr := port.closeSignal.Close()
+		if err == nil {
+			err = pipeErr
 		}
 	}
-	return nil
+	return err
 }
 
 func (port *unixPort) Read(p []byte) (int, error) {
@@ -93,7 +92,7 @@ func (port *unixPort) Read(p []byte) (int, error) {
 			return 0, nil
 		}
 		n, err := unix.Read(port.handle, p)
-		if err == unix.EINTR {
+		if err == unix.EINTR || err == unix.EAGAIN {
 			continue
 		}
 		// Linux: when the port is disconnected during a read operation
@@ -110,11 +109,37 @@ func (port *unixPort) Read(p []byte) (int, error) {
 }
 
 func (port *unixPort) Write(p []byte) (n int, err error) {
-	n, err = unix.Write(port.handle, p)
-	if n < 0 { // Do not return -1 unix errors
-		n = 0
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return 0, &PortError{code: PortClosed}
 	}
-	return
+
+	closed := unixutils.NewFDSet(port.closeSignal.ReadFD())
+	writable := unixutils.NewFDSet(port.handle)
+	for n < len(p) {
+		ready, err := unixutils.Select(closed, writable, nil, -1)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return n, err
+		}
+		if ready.IsReadable(port.closeSignal.ReadFD()) {
+			return n, &PortError{code: PortClosed}
+		}
+		count, err := unix.Write(port.handle, p[n:])
+		if count > 0 {
+			n += count
+		}
+		if err == unix.EINTR || err == unix.EAGAIN {
+			continue
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 func (port *unixPort) Break(t time.Duration) error {
@@ -132,6 +157,12 @@ func (port *unixPort) Break(t time.Duration) error {
 }
 
 func (port *unixPort) SetMode(mode *Mode) error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return &PortError{code: PortClosed}
+	}
+
 	settings, err := port.getTermSettings()
 	if err != nil {
 		return err
@@ -228,6 +259,16 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 		readTimeout: NoTimeout,
 	}
 
+	if err := port.acquireExclusiveAccess(); err != nil {
+		port.Close()
+		code := InvalidSerialPort
+		if err == unix.EBUSY {
+			code = PortBusy
+		}
+		return nil, &PortError{code: code, causedBy: fmt.Errorf("error acquiring exclusive access: %w", err)}
+	}
+	port.exclusive = true
+
 	// Setup serial port
 	settings, err := port.getTermSettings()
 	if err != nil {
@@ -275,11 +316,9 @@ func nativeOpen(portName string, mode *Mode) (*unixPort, error) {
 		return nil, &PortError{code: InvalidSerialPort, causedBy: fmt.Errorf("error configuring port: %w", err)}
 	}
 
-	unix.SetNonblock(h, false)
+	// Keep nonblocking mode so the close signal can stop pending I/O.
 
-	port.acquireExclusiveAccess()
-
-	// This pipe is used as a signal to cancel blocking Read
+	// This pipe cancels pending Read and Write operations.
 	if pipe, err := unixutils.NewPipe(); err != nil {
 		port.Close()
 		return nil, &PortError{code: InvalidSerialPort, causedBy: fmt.Errorf("error opening signaling pipe: %w", err)}
@@ -459,6 +498,15 @@ func (port *unixPort) setModemBitsStatus(status int) error {
 }
 
 func (port *unixPort) acquireExclusiveAccess() error {
+	if runtime.GOOS == "linux" {
+		// TIOCEXCL cannot arbitrate handles opened before exclusive mode was set.
+		if err := unix.Flock(port.handle, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			if err == unix.EWOULDBLOCK {
+				return unix.EBUSY
+			}
+			return err
+		}
+	}
 	return unix.IoctlSetInt(port.handle, unix.TIOCEXCL, 0)
 }
 
