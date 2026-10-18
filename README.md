@@ -10,7 +10,7 @@ See the package documentation here: https://pkg.go.dev/go.bug.st/serial
 
 ## Tests
 
-Run `go test -race ./...`. On macOS, the closed-port Drain regression uses
+Run `go test -race ./...`. On macOS and Linux, the closed-port Drain regression uses
 Python 3 from PATH to create private pseudo-terminals. It opens no physical
 serial device. The test reports a skip if Python 3 is unavailable.
 

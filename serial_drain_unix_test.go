@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 package serial_test
 
 import (

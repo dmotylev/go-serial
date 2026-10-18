@@ -8,6 +8,7 @@ package serial
 
 import (
 	"regexp"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -60,16 +61,20 @@ var databitsMap = map[int]uint32{
 	8: unix.CS8,
 }
 
-const tcCMSPAR = unix.CMSPAR
-const tcIUCLC = unix.IUCLC
+const (
+	tcCMSPAR = unix.CMSPAR
+	tcIUCLC  = unix.IUCLC
+)
 
 const tcCRTSCTS uint32 = unix.CRTSCTS
 
-const ioctlTcgetattr = unix.TCGETS
-const ioctlTcsetattr = unix.TCSETS
-const ioctlTcflsh = unix.TCFLSH
-const ioctlTioccbrk = unix.TIOCCBRK
-const ioctlTiocsbrk = unix.TIOCSBRK
+const (
+	ioctlTcgetattr = unix.TCGETS
+	ioctlTcsetattr = unix.TCSETS
+	ioctlTcflsh    = unix.TCFLSH
+	ioctlTioccbrk  = unix.TIOCCBRK
+	ioctlTiocsbrk  = unix.TIOCSBRK
+)
 
 func toTermiosSpeedType(speed uint32) uint32 {
 	return speed
@@ -92,6 +97,12 @@ func setTermSettingsBaudrate(speed int, settings *unix.Termios) (error, bool) {
 }
 
 func (port *unixPort) Drain() error {
+	port.closeLock.RLock()
+	defer port.closeLock.RUnlock()
+	if atomic.LoadUint32(&port.opened) != 1 {
+		return &PortError{code: PortClosed}
+	}
+
 	// It's not super well documented, but this is the same as calling tcdrain:
 	// - https://git.musl-libc.org/cgit/musl/tree/src/termios/tcdrain.c
 	// - https://elixir.bootlin.com/linux/v6.2.8/source/drivers/tty/tty_io.c#L2673
