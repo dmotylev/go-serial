@@ -10,18 +10,22 @@ See the package documentation here: https://pkg.go.dev/go.bug.st/serial
 
 ## Tests
 
-Run `go test -race ./...`. On macOS and Linux, the closed-port Drain regression uses
-Python 3 from PATH to create private pseudo-terminals. It opens no physical
-serial device. The test reports a skip if Python 3 is unavailable.
+Run `go test -race ./...`. On macOS and Linux, the Drain and Write/Close
+regressions use Python 3 from PATH to create private pseudo-terminals. They open
+no physical serial device and report a skip if Python 3 is unavailable.
 
-To run that regression explicitly, use:
+To run these regressions explicitly, use:
 
 ```sh
 go test -race -count=1 -run TestDrainClosedPortDoesNotAffectCurrentPTY -v .
+go test -race -count=1 -run 'TestWritePrivatePTYTransfer|TestWriteCloseCancelsBlockedWrite' -v .
 ```
 
-It checks sequential calls after Close and reopen. It does not establish a bound
+The Drain test checks sequential calls after Close and reopen. It does not establish a bound
 for a blocked Drain or concurrent Drain/Close, or qualify a USB serial driver.
+The Write test confirms a peer received bytes while a write was still
+outstanding, then checks that Close and Write complete with a positive partial
+count and `PortClosed`. It does not identify the exact kernel blocking point.
 
 ## Credits
 
