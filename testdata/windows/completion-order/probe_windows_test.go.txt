@@ -1,0 +1,59 @@
+package serial
+
+import (
+	"errors"
+	"testing"
+	"testing/synctest"
+)
+
+func TestCloseBeforeCompletionCallRetainsSubmissionHandle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		readDone := make(chan error, 1)
+		go func() {
+			_, err := port.Read(make([]byte, 8))
+			readDone <- err
+		}()
+		<-probeCalls.beforeWait
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			t.Error("Close returned before the completion call")
+		default:
+		}
+		close(probeCalls.resume)
+		synctest.Wait()
+		err = <-readDone
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Errorf("Read error = %v; want PortClosed", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		t.Logf("ReadFile=%d GetOverlappedResult=%d CancelIoEx=%d closes=%d closed-before-wait=%t", probeCalls.submitted, probeCalls.waited, probeCalls.cancelled, probeCalls.closed, probeCalls.closedBeforeWait)
+		if probeCalls.submitted != probePortHandle || probeCalls.waited != probeCalls.submitted {
+			t.Errorf("completion handle %d differs from submission handle %d", probeCalls.waited, probeCalls.submitted)
+		}
+		if probeCalls.cancelled != probePortHandle {
+			t.Errorf("cancellation handle = %d; want %d", probeCalls.cancelled, probePortHandle)
+		}
+		if probeCalls.closedBeforeWait || probeCalls.closed != 1 {
+			t.Errorf("native close ordering: before completion=%t count=%d", probeCalls.closedBeforeWait, probeCalls.closed)
+		}
+	})
+}

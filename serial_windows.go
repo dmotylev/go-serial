@@ -19,6 +19,7 @@ package serial
 
 import (
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,8 +31,14 @@ import (
 
 type windowsPort struct {
 	mu         sync.Mutex
+	configMu   sync.Mutex
 	handle     windows.Handle
 	hasTimeout bool
+	closing    bool
+	closed     chan struct{}
+	closeErr   error
+	active     int
+	activeDone chan struct{}
 }
 
 func nativeGetPortsList() ([]string, error) {
@@ -66,44 +73,100 @@ func nativeGetPortsList() ([]string, error) {
 
 func (port *windowsPort) Close() error {
 	port.mu.Lock()
-	defer func() {
-		port.handle = 0
+	if port.closing {
+		done := port.closed
 		port.mu.Unlock()
-	}()
-	if port.handle == 0 {
+		<-done
+		return port.closeErr
+	}
+	port.closing = true
+	port.closed = make(chan struct{})
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	if handle == 0 {
+		close(port.closed)
+		port.mu.Unlock()
 		return nil
 	}
-	return windows.CloseHandle(port.handle)
+	cancelErr := windows.CancelIoEx(handle, nil)
+	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
+		cancelErr = nil
+	}
+	port.mu.Unlock()
+
+	for {
+		port.mu.Lock()
+		if port.active == 0 {
+			break
+		}
+		done := port.activeDone
+		port.mu.Unlock()
+		<-done
+	}
+	closeErr := windows.CloseHandle(handle)
+	port.handle = 0
+	port.closeErr = errors.Join(cancelErr, closeErr)
+	close(port.closed)
+	port.mu.Unlock()
+	return port.closeErr
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return 0, &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+
 	var readed uint32
 	ev, err := createOverlappedEvent()
 	if err != nil {
 		return 0, err
 	}
 	defer windows.CloseHandle(ev.HEvent)
+	var pins runtime.Pinner
+	pins.Pin(ev)
+	if len(p) != 0 {
+		pins.Pin(&p[0])
+	}
+	defer pins.Unpin()
 
 	for {
-		err = windows.ReadFile(port.handle, p, &readed, ev)
+		port.mu.Lock()
+		if port.closing {
+			port.mu.Unlock()
+			return 0, &PortError{code: PortClosed}
+		}
+		err = windows.ReadFile(handle, p, &readed, ev)
+		port.mu.Unlock()
 		if err == windows.ERROR_IO_PENDING {
-			err = windows.GetOverlappedResult(port.handle, ev, &readed, true)
+			err = windows.GetOverlappedResult(handle, ev, &readed, true)
 		}
 		switch err {
 		case nil:
-			// operation completed successfully
 		case windows.ERROR_OPERATION_ABORTED:
-			// port may have been closed
 			return int(readed), &PortError{code: PortClosed, causedBy: err}
 		default:
-			// error happened
 			return int(readed), err
 		}
 		if readed > 0 {
 			return int(readed), nil
 		}
-
-		// Timeout
 		port.mu.Lock()
 		hasTimeout := port.hasTimeout
 		port.mu.Unlock()
@@ -114,30 +177,115 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 }
 
 func (port *windowsPort) Write(p []byte) (int, error) {
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return 0, &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+
 	var writed uint32
 	ev, err := createOverlappedEvent()
 	if err != nil {
 		return 0, err
 	}
 	defer windows.CloseHandle(ev.HEvent)
-	err = windows.WriteFile(port.handle, p, &writed, ev)
+	var pins runtime.Pinner
+	pins.Pin(ev)
+	if len(p) != 0 {
+		pins.Pin(&p[0])
+	}
+	defer pins.Unpin()
+
+	port.mu.Lock()
+	if port.closing {
+		port.mu.Unlock()
+		return 0, &PortError{code: PortClosed}
+	}
+	err = windows.WriteFile(handle, p, &writed, ev)
+	port.mu.Unlock()
 	if err == windows.ERROR_IO_PENDING {
-		// wait for write to complete
-		err = windows.GetOverlappedResult(port.handle, ev, &writed, true)
+		err = windows.GetOverlappedResult(handle, ev, &writed, true)
 	}
 	return int(writed), err
 }
 
 func (port *windowsPort) Drain() (err error) {
-	return windows.FlushFileBuffers(port.handle)
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+	return windows.FlushFileBuffers(handle)
 }
 
 func (port *windowsPort) ResetInputBuffer() error {
-	return windows.PurgeComm(port.handle, windows.PURGE_RXCLEAR|windows.PURGE_RXABORT)
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+	return windows.PurgeComm(handle, windows.PURGE_RXCLEAR|windows.PURGE_RXABORT)
 }
 
 func (port *windowsPort) ResetOutputBuffer() error {
-	return windows.PurgeComm(port.handle, windows.PURGE_TXCLEAR|windows.PURGE_TXABORT)
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+	return windows.PurgeComm(handle, windows.PURGE_TXCLEAR|windows.PURGE_TXABORT)
 }
 
 const (
@@ -176,13 +324,33 @@ var stopBitsMap = map[StopBits]byte{
 }
 
 func (port *windowsPort) SetMode(mode *Mode) error {
-	params := windows.DCB{}
-	if windows.GetCommState(port.handle, &params) != nil {
-		port.Close()
-		return &PortError{code: InvalidSerialPort}
+	port.configMu.Lock()
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		port.configMu.Unlock()
+		return &PortError{code: PortClosed}
 	}
-	port.setModeParams(mode, &params)
-	if windows.SetCommState(port.handle, &params) != nil {
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+
+	params := windows.DCB{}
+	err := windows.GetCommState(handle, &params)
+	if err == nil {
+		port.setModeParams(mode, &params)
+		err = windows.SetCommState(handle, &params)
+	}
+	port.mu.Lock()
+	port.active--
+	close(port.activeDone)
+	port.activeDone = make(chan struct{})
+	port.mu.Unlock()
+	port.configMu.Unlock()
+	if err != nil {
 		port.Close()
 		return &PortError{code: InvalidSerialPort}
 	}
@@ -205,6 +373,28 @@ func (port *windowsPort) setModeParams(mode *Mode, params *windows.DCB) {
 }
 
 func (port *windowsPort) SetDTR(dtr bool) error {
+	port.configMu.Lock()
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		port.configMu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+		port.configMu.Unlock()
+	}()
+
 	// Like for RTS there are problems with the windows.EscapeCommFunction
 	// observed behaviour was that DTR is set from false -> true
 	// when setting RTS from true -> false
@@ -229,14 +419,14 @@ func (port *windowsPort) SetDTR(dtr bool) error {
 	// The following seems a more reliable way to do it
 
 	params := &windows.DCB{}
-	if err := windows.GetCommState(port.handle, params); err != nil {
+	if err := windows.GetCommState(handle, params); err != nil {
 		return &PortError{causedBy: err}
 	}
 	params.Flags &= dcbDTRControlDisableMask
 	if dtr {
 		params.Flags |= windows.DTR_CONTROL_ENABLE
 	}
-	if err := windows.SetCommState(port.handle, params); err != nil {
+	if err := windows.SetCommState(handle, params); err != nil {
 		return &PortError{causedBy: err}
 	}
 
@@ -244,6 +434,28 @@ func (port *windowsPort) SetDTR(dtr bool) error {
 }
 
 func (port *windowsPort) SetRTS(rts bool) error {
+	port.configMu.Lock()
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		port.configMu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+		port.configMu.Unlock()
+	}()
+
 	// It seems that there is a bug in the Windows VCP driver:
 	// it doesn't send USB control message when the RTS bit is
 	// changed, so the following code not always works with
@@ -267,20 +479,39 @@ func (port *windowsPort) SetRTS(rts bool) error {
 	// The following seems a more reliable way to do it
 
 	params := &windows.DCB{}
-	if err := windows.GetCommState(port.handle, params); err != nil {
+	if err := windows.GetCommState(handle, params); err != nil {
 		return &PortError{causedBy: err}
 	}
 	params.Flags &= dcbRTSControlDisableMask
 	if rts {
 		params.Flags |= windows.RTS_CONTROL_ENABLE
 	}
-	if err := windows.SetCommState(port.handle, params); err != nil {
+	if err := windows.SetCommState(handle, params); err != nil {
 		return &PortError{causedBy: err}
 	}
 	return nil
 }
 
 func (port *windowsPort) GetModemStatusBits() (*ModemStatusBits, error) {
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return nil, &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+
 	// GetCommModemStatus constants. See https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcommmodemstatus.
 	const (
 		MS_CTS_ON  = 0x0010
@@ -289,7 +520,7 @@ func (port *windowsPort) GetModemStatusBits() (*ModemStatusBits, error) {
 		MS_RLSD_ON = 0x0080
 	)
 	var bits uint32
-	if err := windows.GetCommModemStatus(port.handle, &bits); err != nil {
+	if err := windows.GetCommModemStatus(handle, &bits); err != nil {
 		return nil, &PortError{}
 	}
 	return &ModemStatusBits{
@@ -332,6 +563,9 @@ func (port *windowsPort) SetReadTimeout(timeout time.Duration) error {
 
 	port.mu.Lock()
 	defer port.mu.Unlock()
+	if port.closing || port.handle == 0 {
+		return &PortError{code: PortClosed}
+	}
 	if err := windows.SetCommTimeouts(port.handle, commTimeouts); err != nil {
 		return &PortError{code: InvalidTimeoutValue, causedBy: err}
 	}
@@ -341,13 +575,32 @@ func (port *windowsPort) SetReadTimeout(timeout time.Duration) error {
 }
 
 func (port *windowsPort) Break(d time.Duration) error {
-	if err := windows.SetCommBreak(port.handle); err != nil {
+	port.mu.Lock()
+	if port.closing || port.handle == 0 {
+		port.mu.Unlock()
+		return &PortError{code: PortClosed}
+	}
+	port.active++
+	if port.activeDone == nil {
+		port.activeDone = make(chan struct{})
+	}
+	handle := port.handle
+	port.mu.Unlock()
+	defer func() {
+		port.mu.Lock()
+		port.active--
+		close(port.activeDone)
+		port.activeDone = make(chan struct{})
+		port.mu.Unlock()
+	}()
+
+	if err := windows.SetCommBreak(handle); err != nil {
 		return &PortError{causedBy: err}
 	}
 
 	time.Sleep(d)
 
-	if err := windows.ClearCommBreak(port.handle); err != nil {
+	if err := windows.ClearCommBreak(handle); err != nil {
 		return &PortError{causedBy: err}
 	}
 

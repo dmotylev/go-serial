@@ -1,0 +1,75 @@
+package serial
+
+import (
+	"testing"
+
+	"golang.org/x/sys/windows"
+)
+
+func TestConfigurationTransactionsPreserveBothUpdates(t *testing.T) {
+	dtr := func(p Port) error { return p.SetDTR(false) }
+	rts := func(p Port) error { return p.SetRTS(false) }
+	mode := func(p Port) error { return p.SetMode(&Mode{BaudRate: 57600}) }
+	for _, tc := range []struct {
+		name   string
+		first  func(Port) error
+		second func(Port) error
+		flags  uint32
+		baud   uint32
+	}{
+		{"DTR-RTS", dtr, rts, 0, 115200},
+		{"RTS-DTR", rts, dtr, 0, 115200},
+		{"Mode-DTR", mode, dtr, windows.RTS_CONTROL_ENABLE, 57600},
+		{"DTR-Mode", dtr, mode, windows.RTS_CONTROL_ENABLE, 57600},
+		{"Mode-RTS", mode, rts, windows.DTR_CONTROL_ENABLE, 57600},
+		{"RTS-Mode", rts, mode, windows.DTR_CONTROL_ENABLE, 57600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probeReset()
+			p, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			mask := uint32(windows.DTR_CONTROL_ENABLE | windows.RTS_CONTROL_ENABLE)
+			probeState.Lock()
+			initial := probeState.dcb
+			probeState.armed = true
+			probeState.Unlock()
+			if initial.Flags&mask != mask || initial.BaudRate != 115200 {
+				t.Fatalf("initial DCB flags=%x baud=%d", initial.Flags, initial.BaudRate)
+			}
+			firstDone := make(chan error, 1)
+			go func() { firstDone <- tc.first(p) }()
+			<-probeState.firstWrite
+			secondDone := make(chan error, 1)
+			go func() { secondDone <- tc.second(p) }()
+			earlySnapshot := false
+			select {
+			case <-probeState.contention:
+			case <-probeState.secondSnapshot:
+				earlySnapshot = true
+			}
+			close(probeState.releaseFirst)
+			if err := <-firstDone; err != nil {
+				t.Errorf("first setter: %v", err)
+			}
+			if err := <-secondDone; err != nil {
+				t.Errorf("second setter: %v", err)
+			}
+			probeState.Lock()
+			final := probeState.dcb
+			gets, sets := probeState.gets, probeState.sets
+			probeState.Unlock()
+			if earlySnapshot {
+				t.Error("second transaction took its snapshot before the first committed")
+			}
+			if final.Flags&mask != tc.flags || final.BaudRate != tc.baud {
+				t.Errorf("lost configuration update: flags=%x baud=%d; want flags=%x baud=%d", final.Flags&mask, final.BaudRate, tc.flags, tc.baud)
+			}
+			if gets != 2 || sets != 2 {
+				t.Errorf("transactions: gets=%d sets=%d; want two each", gets, sets)
+			}
+		})
+	}
+}

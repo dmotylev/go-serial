@@ -1,0 +1,102 @@
+package serial
+
+import (
+	"sync"
+
+	"golang.org/x/sys/windows"
+)
+
+type probeConfigMutex struct{ sync.Mutex }
+
+func (m *probeConfigMutex) Lock() {
+	if m.Mutex.TryLock() {
+		return
+	}
+	probeState.contention <- struct{}{}
+	m.Mutex.Lock()
+}
+
+var probeState struct {
+	sync.Mutex
+	dcb            windows.DCB
+	armed          bool
+	gets           int
+	sets           int
+	firstWrite     chan struct{}
+	releaseFirst   chan struct{}
+	secondSnapshot chan struct{}
+	contention     chan struct{}
+}
+
+func probeReset() {
+	probeState.Lock()
+	defer probeState.Unlock()
+	probeState.dcb = windows.DCB{}
+	probeState.armed = false
+	probeState.gets = 0
+	probeState.sets = 0
+	probeState.firstWrite = make(chan struct{})
+	probeState.releaseFirst = make(chan struct{})
+	probeState.secondSnapshot = make(chan struct{})
+	probeState.contention = make(chan struct{}, 1)
+}
+
+func probeCreateFile(_ *uint16, _ uint32, _ uint32, _ *windows.SecurityAttributes, _ uint32, _ uint32, _ windows.Handle) (windows.Handle, error) {
+	return 400, nil
+}
+
+func probeGetCommState(handle windows.Handle, dcb *windows.DCB) error {
+	if handle != 400 {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	probeState.Lock()
+	defer probeState.Unlock()
+	*dcb = probeState.dcb
+	if probeState.armed {
+		probeState.gets++
+		if probeState.gets == 2 {
+			close(probeState.secondSnapshot)
+		}
+	}
+	return nil
+}
+
+func probeSetCommState(handle windows.Handle, dcb *windows.DCB) error {
+	if handle != 400 {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	probeState.Lock()
+	first := false
+	if probeState.armed {
+		probeState.sets++
+		first = probeState.sets == 1
+	}
+	probeState.Unlock()
+	if first {
+		close(probeState.firstWrite)
+		<-probeState.releaseFirst
+	}
+	probeState.Lock()
+	probeState.dcb = *dcb
+	probeState.Unlock()
+	return nil
+}
+
+func probeSetCommTimeouts(_ windows.Handle, _ *windows.CommTimeouts) error { return nil }
+func probeCloseHandle(_ windows.Handle) error                              { return nil }
+func probeCancelIoEx(_ windows.Handle, _ *windows.Overlapped) error        { return nil }
+func probeCreateEvent(_ *windows.SecurityAttributes, _ uint32, _ uint32, _ *uint16) (windows.Handle, error) {
+	panic("unexpected CreateEvent")
+}
+
+func probeReadFile(_ windows.Handle, _ []byte, _ *uint32, _ *windows.Overlapped) error {
+	panic("unexpected ReadFile")
+}
+
+func probeWriteFile(_ windows.Handle, _ []byte, _ *uint32, _ *windows.Overlapped) error {
+	panic("unexpected WriteFile")
+}
+
+func probeGetOverlappedResult(_ windows.Handle, _ *windows.Overlapped, _ *uint32, _ bool) error {
+	panic("unexpected GetOverlappedResult")
+}

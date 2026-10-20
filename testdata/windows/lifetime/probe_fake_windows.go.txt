@@ -1,0 +1,335 @@
+package serial
+
+import (
+	"errors"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/windows"
+)
+
+const (
+	probePortHandle  windows.Handle = 400
+	probeEventHandle windows.Handle = 401
+)
+
+var errProbeUnexpectedReadRetry = errors.New("unexpected ReadFile retry after Close cancellation")
+
+var probeCalls = struct {
+	sync.Mutex
+	opened                 bool
+	readCalls              int
+	completionErr          error
+	readHandle             windows.Handle
+	writeHandle            windows.Handle
+	waitHandle             windows.Handle
+	cancelHandle           windows.Handle
+	closeCount             int
+	closedBeforeCompletion bool
+	completed              bool
+	waitEntered            chan struct{}
+	cancelled              chan struct{}
+	release                chan struct{}
+	holdModeSet            bool
+	modeGetHandle          windows.Handle
+	modeSetHandle          windows.Handle
+	modeSetEntered         chan struct{}
+	releaseModeSet         chan struct{}
+	modeSetCompleted       bool
+	closedBeforeModeSet    bool
+	failModeSet            bool
+	controlHandle          windows.Handle
+	controlFlags           uint32
+	controlEntered         chan struct{}
+	releaseControl         chan struct{}
+	holdControl            bool
+	controlCompleted       bool
+	closedBeforeControl    bool
+	breakSetHandle         windows.Handle
+	breakClearHandle       windows.Handle
+	breakSetEntered        chan struct{}
+	releaseBreakSet        chan struct{}
+	breakClearEntered      chan struct{}
+	releaseBreakClear      chan struct{}
+	breakSetReturnedAt     time.Time
+	breakClearEnteredAt    time.Time
+	breakArmed             bool
+	breakClearCompleted    bool
+	closedBeforeBreakClear bool
+	timeoutSetCalls        int
+	timeoutSetHandle       windows.Handle
+}{}
+
+func probeReset() {
+	probeCalls.Lock()
+	probeCalls.opened = false
+	probeCalls.readCalls = 0
+	probeCalls.completionErr = windows.ERROR_OPERATION_ABORTED
+	probeCalls.readHandle = 0
+	probeCalls.writeHandle = 0
+	probeCalls.waitHandle = 0
+	probeCalls.cancelHandle = 0
+	probeCalls.closeCount = 0
+	probeCalls.closedBeforeCompletion = false
+	probeCalls.completed = false
+	probeCalls.waitEntered = make(chan struct{})
+	probeCalls.cancelled = make(chan struct{})
+	probeCalls.release = make(chan struct{})
+	probeCalls.holdModeSet = false
+	probeCalls.modeGetHandle = 0
+	probeCalls.modeSetHandle = 0
+	probeCalls.modeSetEntered = nil
+	probeCalls.releaseModeSet = nil
+	probeCalls.modeSetCompleted = false
+	probeCalls.closedBeforeModeSet = false
+	probeCalls.failModeSet = false
+	probeCalls.controlHandle = 0
+	probeCalls.controlFlags = 0
+	probeCalls.controlEntered = nil
+	probeCalls.releaseControl = nil
+	probeCalls.holdControl = false
+	probeCalls.controlCompleted = false
+	probeCalls.closedBeforeControl = false
+	probeCalls.breakSetHandle = 0
+	probeCalls.breakClearHandle = 0
+	probeCalls.breakSetEntered = nil
+	probeCalls.releaseBreakSet = nil
+	probeCalls.breakClearEntered = nil
+	probeCalls.releaseBreakClear = nil
+	probeCalls.breakSetReturnedAt = time.Time{}
+	probeCalls.breakClearEnteredAt = time.Time{}
+	probeCalls.breakArmed = false
+	probeCalls.breakClearCompleted = false
+	probeCalls.closedBeforeBreakClear = false
+	probeCalls.timeoutSetCalls = 0
+	probeCalls.timeoutSetHandle = 0
+	probeCalls.Unlock()
+}
+
+func probeHoldBreak() {
+	probeCalls.Lock()
+	probeCalls.breakSetEntered = make(chan struct{})
+	probeCalls.releaseBreakSet = make(chan struct{})
+	probeCalls.breakClearEntered = make(chan struct{})
+	probeCalls.releaseBreakClear = make(chan struct{})
+	probeCalls.Unlock()
+}
+
+func probeHoldControl() {
+	probeCalls.Lock()
+	probeCalls.holdControl = true
+	probeCalls.controlEntered = make(chan struct{})
+	probeCalls.releaseControl = make(chan struct{})
+	probeCalls.Unlock()
+}
+
+func probeHoldModeSet() {
+	probeCalls.Lock()
+	probeCalls.holdModeSet = true
+	probeCalls.modeSetEntered = make(chan struct{})
+	probeCalls.releaseModeSet = make(chan struct{})
+	probeCalls.Unlock()
+}
+
+func probeFailModeSet() {
+	probeCalls.Lock()
+	probeCalls.failModeSet = true
+	probeCalls.Unlock()
+}
+
+func probeCreateFile(path *uint16, access uint32, share uint32, sa *windows.SecurityAttributes, disposition uint32, flags uint32, template windows.Handle) (windows.Handle, error) {
+	probeCalls.Lock()
+	probeCalls.opened = true
+	probeCalls.Unlock()
+	return probePortHandle, nil
+}
+
+func probeGetCommState(h windows.Handle, dcb *windows.DCB) error {
+	if h != probePortHandle {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	probeCalls.Lock()
+	if probeCalls.holdModeSet {
+		probeCalls.modeGetHandle = h
+	}
+	probeCalls.Unlock()
+	return nil
+}
+
+func probeSetCommState(h windows.Handle, dcb *windows.DCB) error {
+	if h != probePortHandle {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	probeCalls.Lock()
+	hold := probeCalls.holdModeSet
+	fail := probeCalls.failModeSet
+	if hold || fail {
+		probeCalls.modeSetHandle = h
+	}
+	probeCalls.Unlock()
+	if hold {
+		close(probeCalls.modeSetEntered)
+		<-probeCalls.releaseModeSet
+		probeCalls.Lock()
+		probeCalls.modeSetCompleted = true
+		wasClosed := probeCalls.closedBeforeModeSet
+		probeCalls.Unlock()
+		if wasClosed {
+			return windows.ERROR_INVALID_HANDLE
+		}
+	}
+	if fail {
+		return windows.ERROR_INVALID_PARAMETER
+	}
+	return nil
+}
+
+func probeSetCommTimeouts(h windows.Handle, timeouts *windows.CommTimeouts) error {
+	probeCalls.Lock()
+	probeCalls.timeoutSetCalls++
+	probeCalls.timeoutSetHandle = h
+	probeCalls.Unlock()
+	if h != probePortHandle {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	return nil
+}
+
+func probeCreateEvent(sa *windows.SecurityAttributes, manualReset uint32, initialState uint32, name *uint16) (windows.Handle, error) {
+	return probeEventHandle, nil
+}
+
+func probeCloseHandle(h windows.Handle) error {
+	if h == probePortHandle {
+		probeCalls.Lock()
+		probeCalls.closeCount++
+		if !probeCalls.completed {
+			probeCalls.closedBeforeCompletion = true
+		}
+		if probeCalls.holdModeSet && !probeCalls.modeSetCompleted {
+			probeCalls.closedBeforeModeSet = true
+		}
+		if probeCalls.holdControl && !probeCalls.controlCompleted {
+			probeCalls.closedBeforeControl = true
+		}
+		if probeCalls.breakArmed && !probeCalls.breakClearCompleted {
+			probeCalls.closedBeforeBreakClear = true
+		}
+		probeCalls.Unlock()
+	}
+	return nil
+}
+
+func probeReadFile(h windows.Handle, p []byte, done *uint32, ov *windows.Overlapped) error {
+	probeCalls.Lock()
+	probeCalls.readCalls++
+	probeCalls.readHandle = h
+	retry := probeCalls.readCalls > 1
+	probeCalls.Unlock()
+	if retry {
+		return errProbeUnexpectedReadRetry
+	}
+	return windows.ERROR_IO_PENDING
+}
+
+func probeWriteFile(h windows.Handle, p []byte, done *uint32, ov *windows.Overlapped) error {
+	probeCalls.Lock()
+	probeCalls.writeHandle = h
+	probeCalls.Unlock()
+	return windows.ERROR_IO_PENDING
+}
+
+func probeGetOverlappedResult(h windows.Handle, ov *windows.Overlapped, done *uint32, wait bool) error {
+	probeCalls.Lock()
+	probeCalls.waitHandle = h
+	probeCalls.Unlock()
+	close(probeCalls.waitEntered)
+	<-probeCalls.release
+	probeCalls.Lock()
+	probeCalls.completed = true
+	err := probeCalls.completionErr
+	probeCalls.Unlock()
+	*done = 0
+	return err
+}
+
+func probeCancelIoEx(h windows.Handle, ov *windows.Overlapped) error {
+	probeCalls.Lock()
+	probeCalls.cancelHandle = h
+	probeCalls.Unlock()
+	close(probeCalls.cancelled)
+	return nil
+}
+
+func probeControlNative(h windows.Handle, flags uint32) error {
+	probeCalls.Lock()
+	probeCalls.controlHandle = h
+	probeCalls.controlFlags = flags
+	hold := probeCalls.holdControl
+	probeCalls.Unlock()
+	if hold {
+		close(probeCalls.controlEntered)
+		<-probeCalls.releaseControl
+	}
+	probeCalls.Lock()
+	probeCalls.controlCompleted = true
+	closed := probeCalls.closedBeforeControl
+	probeCalls.Unlock()
+	if h != probePortHandle || closed {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	return nil
+}
+
+func probePurgeComm(h windows.Handle, flags uint32) error {
+	return probeControlNative(h, flags)
+}
+
+func probeGetCommModemStatus(h windows.Handle, bits *uint32) error {
+	if err := probeControlNative(h, 0); err != nil {
+		return err
+	}
+	*bits = 0x0050 // CTS and RI
+	return nil
+}
+
+func probeFlushFileBuffers(h windows.Handle) error {
+	return probeControlNative(h, 0)
+}
+
+func probeSetCommBreak(h windows.Handle) error {
+	probeCalls.Lock()
+	probeCalls.breakSetHandle = h
+	probeCalls.breakArmed = true
+	entered := probeCalls.breakSetEntered
+	release := probeCalls.releaseBreakSet
+	probeCalls.Unlock()
+	close(entered)
+	<-release
+	probeCalls.Lock()
+	probeCalls.breakSetReturnedAt = time.Now()
+	probeCalls.Unlock()
+	if h != probePortHandle {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	return nil
+}
+
+func probeClearCommBreak(h windows.Handle) error {
+	probeCalls.Lock()
+	probeCalls.breakClearHandle = h
+	probeCalls.breakClearEnteredAt = time.Now()
+	entered := probeCalls.breakClearEntered
+	release := probeCalls.releaseBreakClear
+	probeCalls.Unlock()
+	close(entered)
+	<-release
+	probeCalls.Lock()
+	probeCalls.breakClearCompleted = true
+	closed := probeCalls.closedBeforeBreakClear
+	probeCalls.Unlock()
+	if h != probePortHandle || closed {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	return nil
+}

@@ -1,0 +1,93 @@
+package serial
+
+import (
+	"sync"
+
+	"golang.org/x/sys/windows"
+)
+
+const (
+	probePortHandle  windows.Handle = 400
+	probeEventHandle windows.Handle = 401
+)
+
+var probeCalls struct {
+	sync.Mutex
+	submitted        windows.Handle
+	waited           windows.Handle
+	cancelled        windows.Handle
+	closed           int
+	waitComplete     bool
+	closedBeforeWait bool
+	beforeWait       chan struct{}
+	resume           chan struct{}
+}
+
+func probeReset() {
+	probeCalls.Lock()
+	defer probeCalls.Unlock()
+	probeCalls.submitted = 0
+	probeCalls.waited = 0
+	probeCalls.cancelled = 0
+	probeCalls.closed = 0
+	probeCalls.waitComplete = false
+	probeCalls.closedBeforeWait = false
+	probeCalls.beforeWait = make(chan struct{})
+	probeCalls.resume = make(chan struct{})
+}
+
+func probeBeforeCompletion() {
+	close(probeCalls.beforeWait)
+	<-probeCalls.resume
+}
+
+func probeCreateFile(_ *uint16, _ uint32, _ uint32, _ *windows.SecurityAttributes, _ uint32, _ uint32, _ windows.Handle) (windows.Handle, error) {
+	return probePortHandle, nil
+}
+
+func probeGetCommState(_ windows.Handle, _ *windows.DCB) error             { return nil }
+func probeSetCommState(_ windows.Handle, _ *windows.DCB) error             { return nil }
+func probeSetCommTimeouts(_ windows.Handle, _ *windows.CommTimeouts) error { return nil }
+
+func probeCreateEvent(_ *windows.SecurityAttributes, _ uint32, _ uint32, _ *uint16) (windows.Handle, error) {
+	return probeEventHandle, nil
+}
+
+func probeCloseHandle(handle windows.Handle) error {
+	if handle == probePortHandle {
+		probeCalls.Lock()
+		probeCalls.closed++
+		probeCalls.closedBeforeWait = !probeCalls.waitComplete
+		probeCalls.Unlock()
+	}
+	return nil
+}
+
+func probeReadFile(handle windows.Handle, _ []byte, _ *uint32, _ *windows.Overlapped) error {
+	probeCalls.Lock()
+	probeCalls.submitted = handle
+	probeCalls.Unlock()
+	return windows.ERROR_IO_PENDING
+}
+
+func probeWriteFile(_ windows.Handle, _ []byte, _ *uint32, _ *windows.Overlapped) error {
+	panic("unexpected WriteFile")
+}
+
+func probeGetOverlappedResult(handle windows.Handle, _ *windows.Overlapped, _ *uint32, _ bool) error {
+	probeCalls.Lock()
+	defer probeCalls.Unlock()
+	probeCalls.waited = handle
+	probeCalls.waitComplete = true
+	if handle != probePortHandle {
+		return windows.ERROR_INVALID_HANDLE
+	}
+	return windows.ERROR_OPERATION_ABORTED
+}
+
+func probeCancelIoEx(handle windows.Handle, _ *windows.Overlapped) error {
+	probeCalls.Lock()
+	probeCalls.cancelled = handle
+	probeCalls.Unlock()
+	return nil
+}

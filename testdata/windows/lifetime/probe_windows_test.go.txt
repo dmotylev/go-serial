@@ -1,0 +1,564 @@
+package serial
+
+import (
+	"errors"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"golang.org/x/sys/windows"
+)
+
+func TestPendingReadKeepsHandleUntilCompletion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		readDone := make(chan error, 1)
+		go func() {
+			_, readErr := port.Read(make([]byte, 8))
+			readDone <- readErr
+		}()
+		<-probeCalls.waitEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		prematureNativeClose := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			prematureNativeClose = true
+		default:
+		}
+		if prematureNativeClose {
+			t.Error("Close returned or closed the native handle before pending Read completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d while Read is pending", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.release)
+		synctest.Wait()
+		err = <-readDone
+		var portError *PortError
+		if !errors.As(err, &portError) || portError.Code() != PortClosed {
+			t.Errorf("Read error = %v; want PortClosed", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeCompletion {
+			t.Error("native handle closed before pending Read completed")
+		}
+		if probeCalls.readHandle != probePortHandle || probeCalls.waitHandle != probePortHandle || probeCalls.cancelHandle != probePortHandle {
+			t.Errorf("handle contract: ReadFile=%d GetOverlappedResult=%d CancelIoEx=%d; want %d", probeCalls.readHandle, probeCalls.waitHandle, probeCalls.cancelHandle, probePortHandle)
+		}
+		if probeCalls.closeCount != 1 {
+			t.Errorf("native port closes = %d; want 1", probeCalls.closeCount)
+		}
+	})
+}
+
+func TestPendingWriteKeepsHandleUntilCompletion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		writeDone := make(chan error, 1)
+		go func() {
+			_, writeErr := port.Write([]byte("W"))
+			writeDone <- writeErr
+		}()
+		<-probeCalls.waitEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close returned or closed the native handle before pending Write completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d while Write is pending", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.release)
+		synctest.Wait()
+		if err = <-writeDone; !errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
+			t.Errorf("Write error = %v; want operation-aborted", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeCompletion {
+			t.Error("native handle closed before pending Write completed")
+		}
+		if probeCalls.writeHandle != probePortHandle || probeCalls.waitHandle != probePortHandle || probeCalls.cancelHandle != probePortHandle {
+			t.Errorf("handle contract: WriteFile=%d GetOverlappedResult=%d CancelIoEx=%d; want %d", probeCalls.writeHandle, probeCalls.waitHandle, probeCalls.cancelHandle, probePortHandle)
+		}
+		if probeCalls.closeCount != 1 {
+			t.Errorf("native port closes = %d; want 1", probeCalls.closeCount)
+		}
+	})
+}
+
+func TestSetModeKeepsHandleUntilConfigurationCompletes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeHoldModeSet()
+		modeDone := make(chan error, 1)
+		go func() { modeDone <- port.SetMode(&Mode{BaudRate: 57600}) }()
+		<-probeCalls.modeSetEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close returned or closed the native handle before SetMode completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d while SetMode is pending", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.releaseModeSet)
+		synctest.Wait()
+		if err = <-modeDone; err != nil {
+			t.Errorf("SetMode: %v", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeModeSet {
+			t.Error("native handle closed before SetMode completed")
+		}
+		if probeCalls.modeGetHandle != probePortHandle || probeCalls.modeSetHandle != probePortHandle || probeCalls.cancelHandle != probePortHandle {
+			t.Errorf("handle contract: GetCommState=%d SetCommState=%d CancelIoEx=%d; want %d", probeCalls.modeGetHandle, probeCalls.modeSetHandle, probeCalls.cancelHandle, probePortHandle)
+		}
+		if probeCalls.closeCount != 1 {
+			t.Errorf("native port closes = %d; want 1", probeCalls.closeCount)
+		}
+	})
+}
+
+func TestSetModeErrorClosesWithoutJoiningItself(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeFailModeSet()
+		err = port.SetMode(&Mode{BaudRate: 57600})
+		var portError *PortError
+		if !errors.As(err, &portError) || portError.Code() != InvalidSerialPort {
+			t.Errorf("SetMode error = %v; want InvalidSerialPort", err)
+		}
+		probeCalls.Lock()
+		if probeCalls.modeSetHandle != probePortHandle || probeCalls.cancelHandle != probePortHandle {
+			t.Errorf("SetCommState=%d CancelIoEx=%d; want %d", probeCalls.modeSetHandle, probeCalls.cancelHandle, probePortHandle)
+		}
+		if probeCalls.closeCount != 1 {
+			t.Errorf("native port closes before explicit Close = %d; want 1", probeCalls.closeCount)
+		}
+		probeCalls.Unlock()
+		if err = port.Close(); err != nil {
+			t.Errorf("Close after SetMode failure: %v", err)
+		}
+	})
+}
+
+func TestSetDTRKeepsHandleUntilConfigurationCompletes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeHoldModeSet()
+		setDone := make(chan error, 1)
+		go func() { setDone <- port.SetDTR(true) }()
+		<-probeCalls.modeSetEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close returned or closed native handle before SetDTR completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.releaseModeSet)
+		synctest.Wait()
+		if err = <-setDone; err != nil {
+			t.Errorf("SetDTR: %v", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeModeSet {
+			t.Error("native handle closed before SetDTR completed")
+		}
+		if probeCalls.modeGetHandle != probePortHandle || probeCalls.modeSetHandle != probePortHandle || probeCalls.closeCount != 1 {
+			t.Errorf("native contract: GetCommState=%d SetCommState=%d closes=%d", probeCalls.modeGetHandle, probeCalls.modeSetHandle, probeCalls.closeCount)
+		}
+	})
+}
+
+func TestSetRTSKeepsHandleUntilConfigurationCompletes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeHoldModeSet()
+		setDone := make(chan error, 1)
+		go func() { setDone <- port.SetRTS(true) }()
+		<-probeCalls.modeSetEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close returned or closed native handle before SetRTS completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.releaseModeSet)
+		synctest.Wait()
+		if err = <-setDone; err != nil {
+			t.Errorf("SetRTS: %v", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeModeSet {
+			t.Error("native handle closed before SetRTS completed")
+		}
+		if probeCalls.modeGetHandle != probePortHandle || probeCalls.modeSetHandle != probePortHandle || probeCalls.closeCount != 1 {
+			t.Errorf("native contract: GetCommState=%d SetCommState=%d closes=%d", probeCalls.modeGetHandle, probeCalls.modeSetHandle, probeCalls.closeCount)
+		}
+	})
+}
+
+func testHeldControl(t *testing.T, call func(Port) error, flags uint32) {
+	t.Helper()
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeHoldControl()
+		callDone := make(chan error, 1)
+		go func() { callDone <- call(port) }()
+		<-probeCalls.controlEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close returned or closed native handle before control call completed")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.releaseControl)
+		synctest.Wait()
+		if err = <-callDone; err != nil {
+			t.Errorf("control call: %v", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeControl {
+			t.Error("native handle closed before control call completed")
+		}
+		if probeCalls.controlHandle != probePortHandle || probeCalls.controlFlags != flags || probeCalls.closeCount != 1 {
+			t.Errorf("native contract: handle=%d flags=%#x closes=%d", probeCalls.controlHandle, probeCalls.controlFlags, probeCalls.closeCount)
+		}
+	})
+}
+
+func TestResetInputBufferKeepsHandleUntilPurgeCompletes(t *testing.T) {
+	testHeldControl(t, func(port Port) error { return port.ResetInputBuffer() }, windows.PURGE_RXCLEAR|windows.PURGE_RXABORT)
+}
+
+func TestResetOutputBufferKeepsHandleUntilPurgeCompletes(t *testing.T) {
+	testHeldControl(t, func(port Port) error { return port.ResetOutputBuffer() }, windows.PURGE_TXCLEAR|windows.PURGE_TXABORT)
+}
+
+func TestGetModemStatusBitsKeepsHandleUntilQueryCompletes(t *testing.T) {
+	var bits *ModemStatusBits
+	testHeldControl(t, func(port Port) error {
+		var err error
+		bits, err = port.GetModemStatusBits()
+		return err
+	}, 0)
+	if bits == nil || !bits.CTS || !bits.RI || bits.DCD || bits.DSR {
+		t.Errorf("modem status = %+v; want CTS and RI only", bits)
+	}
+}
+
+func TestDrainKeepsHandleUntilFlushCompletes(t *testing.T) {
+	testHeldControl(t, func(port Port) error { return port.Drain() }, 0)
+}
+
+func TestSetReadTimeoutAfterCloseRejectsWithoutNativeCall(t *testing.T) {
+	probeReset()
+	port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := port.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	probeCalls.Lock()
+	before := probeCalls.timeoutSetCalls
+	probeCalls.Unlock()
+
+	err = port.SetReadTimeout(time.Second)
+	var portError *PortError
+	if !errors.As(err, &portError) || portError.Code() != PortClosed {
+		t.Errorf("SetReadTimeout after Close = %v; want PortClosed", err)
+	}
+	probeCalls.Lock()
+	defer probeCalls.Unlock()
+	if probeCalls.timeoutSetCalls != before {
+		t.Errorf("SetCommTimeouts called %d times after Close; want zero", probeCalls.timeoutSetCalls-before)
+	}
+}
+
+func TestBreakKeepsHandleUntilClearCompletes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		probeHoldBreak()
+		const duration = 2 * time.Second
+		breakDone := make(chan error, 1)
+		go func() { breakDone <- port.Break(duration) }()
+		<-probeCalls.breakSetEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		synctest.Wait()
+
+		probeCalls.Lock()
+		closedEarly := probeCalls.closeCount != 0
+		cancelHandle := probeCalls.cancelHandle
+		probeCalls.Unlock()
+		closeReturned := false
+		var closeErr error
+		select {
+		case closeErr = <-closeDone:
+			closeReturned = true
+			closedEarly = true
+		default:
+		}
+		if closedEarly {
+			t.Error("Close released native handle before SetCommBreak returned")
+		}
+		if cancelHandle != probePortHandle {
+			t.Errorf("CancelIoEx handle = %d; want %d", cancelHandle, probePortHandle)
+		}
+
+		close(probeCalls.releaseBreakSet)
+		<-probeCalls.breakClearEntered
+		synctest.Wait()
+		probeCalls.Lock()
+		closedEarly = probeCalls.closeCount != 0
+		elapsed := probeCalls.breakClearEnteredAt.Sub(probeCalls.breakSetReturnedAt)
+		probeCalls.Unlock()
+		if !closeReturned {
+			select {
+			case closeErr = <-closeDone:
+				closeReturned = true
+				closedEarly = true
+			default:
+			}
+		}
+		if closedEarly {
+			t.Error("Close released native handle before ClearCommBreak completed")
+		}
+		if elapsed < duration {
+			t.Errorf("Break duration before ClearCommBreak = %s; want at least %s", elapsed, duration)
+		}
+
+		close(probeCalls.releaseBreakClear)
+		synctest.Wait()
+		if err = <-breakDone; err != nil {
+			t.Errorf("Break: %v", err)
+		}
+		if !closeReturned {
+			closeErr = <-closeDone
+		}
+		if closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.closedBeforeBreakClear {
+			t.Error("native handle closed before ClearCommBreak completed")
+		}
+		if probeCalls.breakSetHandle != probePortHandle || probeCalls.breakClearHandle != probePortHandle || probeCalls.closeCount != 1 {
+			t.Errorf("native contract: SetCommBreak=%d ClearCommBreak=%d closes=%d", probeCalls.breakSetHandle, probeCalls.breakClearHandle, probeCalls.closeCount)
+		}
+	})
+}
+
+func TestReadDoesNotRetryAfterCloseCancelsZeroCompletion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		probeReset()
+		probeCalls.Lock()
+		probeCalls.completionErr = nil
+		probeCalls.Unlock()
+		port, err := Open("SIMULATED", &Mode{BaudRate: 115200})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if err := port.SetReadTimeout(NoTimeout); err != nil {
+			t.Fatalf("SetReadTimeout: %v", err)
+		}
+		type readResult struct {
+			n   int
+			err error
+		}
+		readDone := make(chan readResult, 1)
+		go func() {
+			n, err := port.Read(make([]byte, 8))
+			readDone <- readResult{n, err}
+		}()
+		<-probeCalls.waitEntered
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- port.Close() }()
+		<-probeCalls.cancelled
+		close(probeCalls.release)
+		result := <-readDone
+		var portError *PortError
+		if result.n != 0 || !errors.As(result.err, &portError) || portError.Code() != PortClosed {
+			t.Errorf("Read = (%d, %v); want (0, PortClosed)", result.n, result.err)
+		}
+		if err := <-closeDone; err != nil {
+			t.Errorf("Close: %v", err)
+		}
+		probeCalls.Lock()
+		defer probeCalls.Unlock()
+		if probeCalls.readCalls != 1 {
+			t.Errorf("ReadFile calls = %d; want 1", probeCalls.readCalls)
+		}
+		if probeCalls.closeCount != 1 {
+			t.Errorf("native port closes = %d; want 1", probeCalls.closeCount)
+		}
+	})
+}
