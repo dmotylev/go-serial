@@ -42,11 +42,15 @@ var databitsMap = map[int]uint64{
 	8: unix.CS8,
 }
 
-const tcCMSPAR uint64 = 0 // may be CMSPAR or PAREXT
-const tcIUCLC uint64 = 0
+const (
+	tcCMSPAR uint64 = 0 // may be CMSPAR or PAREXT
+	tcIUCLC  uint64 = 0
+)
 
-const tcCCTS_OFLOW uint64 = 0x00010000
-const tcCRTS_IFLOW uint64 = 0x00020000
+const (
+	tcCCTS_OFLOW uint64 = 0x00010000
+	tcCRTS_IFLOW uint64 = 0x00020000
+)
 
 const tcCRTSCTS uint64 = (tcCCTS_OFLOW | tcCRTS_IFLOW)
 

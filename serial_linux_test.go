@@ -37,7 +37,6 @@ func startSocatAndWaitForPort(t *testing.T, ctx context.Context) *exec.Cmd {
 }
 
 func TestSerialReadAndCloseConcurrency(t *testing.T) {
-
 	// Run this test with race detector to actually test that
 	// the correct multitasking behaviour is happening.
 

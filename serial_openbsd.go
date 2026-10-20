@@ -38,8 +38,8 @@ var baudrateMap = map[int]uint32{
 	57600:  unix.B57600,
 	115200: unix.B115200,
 	230400: unix.B230400,
-	//460800: unix.B460800,
-	//921600: unix.B921600,
+	// 460800: unix.B460800,
+	// 921600: unix.B921600,
 }
 
 var databitsMap = map[int]uint32{
@@ -50,19 +50,25 @@ var databitsMap = map[int]uint32{
 	8: unix.CS8,
 }
 
-const tcCMSPAR uint32 = 0 // may be CMSPAR or PAREXT
-const tcIUCLC uint32 = 0
+const (
+	tcCMSPAR uint32 = 0 // may be CMSPAR or PAREXT
+	tcIUCLC  uint32 = 0
+)
 
-const tcCCTS_OFLOW uint32 = 0x00010000
-const tcCRTS_IFLOW uint32 = 0x00020000
+const (
+	tcCCTS_OFLOW uint32 = 0x00010000
+	tcCRTS_IFLOW uint32 = 0x00020000
+)
 
 const tcCRTSCTS uint32 = tcCCTS_OFLOW
 
-const ioctlTcgetattr = unix.TIOCGETA
-const ioctlTcsetattr = unix.TIOCSETA
-const ioctlTcflsh = unix.TIOCFLUSH
-const ioctlTioccbrk = unix.TIOCCBRK
-const ioctlTiocsbrk = unix.TIOCSBRK
+const (
+	ioctlTcgetattr = unix.TIOCGETA
+	ioctlTcsetattr = unix.TIOCSETA
+	ioctlTcflsh    = unix.TIOCFLUSH
+	ioctlTioccbrk  = unix.TIOCCBRK
+	ioctlTiocsbrk  = unix.TIOCSBRK
+)
 
 func toTermiosSpeedType(speed uint32) int32 {
 	return int32(speed)
